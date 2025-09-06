@@ -1,0 +1,6 @@
+<launch>
+  <node pkg="yolop_trt" type="yolop_trt" name="yolop_trt" output="screen">
+    <param name="engine_path" value="$(find yolop_trt)/yolop.plan"/>
+    <param name="image_topic" value="/camera/image_raw"/>
+  </node>
+</launch>
