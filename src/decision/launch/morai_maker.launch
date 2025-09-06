@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<launch>
+    <!-- <include file="$(find handsfree_ros_imu)/launch/handsfree_imu.launch"/> -->
+  	<!-- <include file="$(find ublox_gps)/launch/ublox_zed-f9p_base.launch"/> -->
+	<node pkg="decision" type="wgs84_to_utmk.py" name="wgs84_to_utmk" output="screen" args="$(arg target)"/>
+	<node pkg="decision" type="morai_maker.py" name="morai_maker" output="screen" args="$(arg target)"/>
+</launch>

@@ -1,0 +1,29 @@
+debug: 1  # Debug 레벨 (0-4)
+
+device: /dev/ttyGPS1
+frame_id: gps
+
+# usb:
+#   in: 7         # USB 입력 프로토콜 비트마스크 (예: UBX|NMEA|RTCM 등; 값은 사용 환경에 맞게)
+#   out: 7       # USB 출력 프로토콜 비트마스크
+
+# Enable u-blox message publishers
+publish:
+  all: false
+  nav:
+    all: true
+    relposned: true
+    posllh: true
+    posecef: true
+
+subscribe:
+  all: false
+  rxm:
+    all: true
+  nav:
+    all: true
+  rtcm:
+    all: true  # RTCM 메시지 구독 활성화
+
+rtcm:
+  enable: true

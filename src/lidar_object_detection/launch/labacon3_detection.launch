@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+	<node pkg="lidar_object_detection" type="labacon3_detection" name="labacon3_detection"/>
+</launch>

@@ -1,0 +1,5 @@
+<launch>
+    <include file="$(find vision)/launch/detection.launch">
+        <arg name="use_morai" value="false"/>
+    </include>
+</launch>

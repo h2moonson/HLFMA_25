@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<launch>
+	<include file="$(find ublox_gps)/launch/ublox_device.launch"/>
+
+	<node pkg="ntrip_ros" type="ntripclient.py" name="ntrip_ros" output="screen">
+		<param name="rtcm_topic" value="/ublox_gps/rtcm"/>
+		<param name="ntrip_server" value="RTS2.ngii.go.kr:2101"/> 
+		<param name="ntrip_user" value="foscar2025"/>
+		<param name="ntrip_pass" value="ngii"/> 
+		<param name="ntrip_stream" value="SSR-SSRG"/>
+		<!-- <param name="ntrip_stream" value="SSR-SSRG"/> -->
+		<!-- <param name="nmea_gga" value="$GPGGA,091440.796,3739.040,N,12703.848,E,1,12,1.0,0.0,M,0.0,M,,*67"/> //집 근처 공원 -->
+		<!-- <param name="nmea_gga" value="$GPGGA,041524.865,3736.655,N,12659.803,E,1,12,1.0,0.0,M,0.0,M,,*66"/>  -->
+		<param name="nmea_gga" value="$GPGGA,041228.113,3736.626,N,12659.818,E,1,12,1.0,0.0,M,0.0,M,,*6B"/>
+	</node>
+
+	<!-- <include file="$(find ublox_gps)/launch/path_maker.launch"/> -->
+</launch>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<launch>
+	<node pkg="ublox_gps" type="wgs84_to_utmk.py" name="wgs84_to_utmk" output="screen"/>
+	<node pkg="ublox_gps" type="path_maker.py" name="path_maker" output="screen"/>
+</launch>

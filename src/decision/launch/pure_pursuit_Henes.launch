@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <include file="$(find lidar_object_detection)/launch/od_without_clustering.launch" />
+    <include file="$(find lidar_object_detection)/launch/labacon3_detection.launch" />
+    <include file="$(find decision)/launch/mode_decider.launch"/>
+    <include file="$(find ntrip_ros)/launch/ntrip_ros.launch"/>
+    
+    <node pkg="decision" type="pure_pursuit_Henes.py" name="pure_pursuit" output="screen"/>
+    <!-- <node pkg="rviz" type="rviz" name="rviz" args="-d $(find pure_pursuit)/rviz/pure_pursuit.rviz" /> -->
+</launch>

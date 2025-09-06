@@ -1,0 +1,10 @@
+<launch>
+    <!-- Launch the GPS path maker (decision pkg assumed) -->
+    <node pkg="decision"
+          type="path_maker.py"
+          name="path_maker"
+          output="screen"/>
+
+    <include file="$(find ntrip_ros)/launch/ntrip_ros.launch"/>
+    
+</launch>

@@ -1,0 +1,15 @@
+<launch>
+  <!-- mode_decider_node 실행 -->
+  <node pkg="decision"
+        type="mode_decider.py"
+        name="mode_decider"
+        output="screen">
+
+    <!-- 파라미터 설정 -->
+    <param name="gps_rms_threshold" value="0.03" />         <!-- 3cm 이하 RMS만 유효 -->
+    <param name="gps_valid_ratio" value="0.95" />            <!-- GPS 95% 이상 유효 시 OK -->
+    <param name="lane_valid_ratio" value="0.90" />           <!-- 차선도 90% 이상 유효 시 OK -->
+    <param name="history_size" value="100" />
+    <param name="decide_rate" value="10.0" />
+  </node>
+</launch>

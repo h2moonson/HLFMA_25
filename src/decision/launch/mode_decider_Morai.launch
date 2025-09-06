@@ -1,0 +1,13 @@
+<launch>
+
+    <node pkg="decision" type="mode_decider_Morai.py" name="mode_decider_morai" output="screen">
+
+
+        <param name="history_size"        value="50" />   
+        <param name="decide_rate"         value="10.0" /> 
+        <param name="gps_valid_ratio"     value="0.9" />  
+        <param name="lane_valid_ratio"    value="0.95" /> 
+        
+        </node>
+
+</launch>

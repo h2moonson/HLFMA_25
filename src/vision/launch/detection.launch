@@ -1,0 +1,30 @@
+<launch>
+    <arg name="use_morai" default="false"/>
+
+    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen" unless="$(eval use_morai)">
+        <param name="video_device" value="/dev/video0"/>
+        <param name="image_width" value="640"/>
+        <param name="image_height" value="480"/>
+        <param name="pixel_format" value="yuyv"/>
+        <param name="camera_frame_id" value="usb_cam"/>
+    </node>
+
+    <node pkg="vision" type="yolop_node" name="yolop_node" output="screen">
+        <param name="use_morai" value="$(arg use_morai)" /> 
+    </node>
+    
+    <node pkg="vision" type="sliding_window.py" name="sliding_window" output="screen">
+        <!-- 카메라 pitch (deg) -->
+        <param name="pitch" value="20"/>
+        <!-- 카메라 yaw (deg) -->
+        <param name="yaw" value="0"/>
+        <!-- 카메라 fov (deg) -->
+        <param name="fov" value="90"/>
+        <!-- 카메라 x pos (m) -->
+        <param name="l" value="0"/>
+        <!-- 카메라 y pos (m) -->
+        <param name="d" value="0"/>
+        <!-- 카메라 z pos (m) -->
+        <param name="h" value="1.49"/>
+    </node>
+</launch>
