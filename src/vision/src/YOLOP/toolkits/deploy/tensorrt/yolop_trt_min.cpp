@@ -1,246 +1,514 @@
-// TensorRT 10.x / C++17
+// yolop_trt_min.cpp — YOLOP TensorRT 데모 (세그 + 디텍션 시각화, 클린업 포함)
+// Build:
+//   g++ yolop_trt_min.cpp -o yolop_trt_min -std=c++17 \
+//     `pkg-config --cflags --libs opencv4` -lnvinfer -lcudart
+//
+// Run:
+//   ./yolop_trt_min ../yolop.plan ../../../../inference/images ./out
+//
+// 포함 기능:
+//  - 입력 letterbox → 출력 언레터박스(원본 좌표 복원)
+//  - FP16/FP32 출력 자동 처리
+//  - 세그: 2채널 softmax / 1채널 sigmoid 자동 분기 + 마스크 클린업
+//  - 디텍션: [1,25200,6] 디코드 + NMS + 드로잉
+//  - 바인딩/shape/dtype 디버그 로그
+//  - 중간 마스크/확률 맵 PNG 저장(파일별)
+
 #include <NvInfer.h>
-#include <cuda_runtime.h>
+#include <NvInferRuntime.h>
+#include <cuda_runtime_api.h>
 #include <opencv2/opencv.hpp>
-#include <filesystem>
+#include <cuda_fp16.h>
+
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <string>
+#include <filesystem>
 #include <algorithm>
-#include <cstring>
+#include <stdexcept>
+#include <cstdint>
+#include <cmath>
+#include <cstdio>   // std::snprintf
 
-namespace fs = std::filesystem;
 using namespace nvinfer1;
 
-struct Logger : ILogger {
+// ====== 설정값 ======
+static const float  kSEG_THRESH = 0.40f;  // 세그 확률 임계값 (0.3~0.6 조절)
+static const float  kDET_CONF   = 0.30f;  // 디텍션 confidence
+static const float  kDET_NMS    = 0.45f;  // 디텍션 NMS IoU
+static const double kALPHA      = 0.45;   // 오버레이 알파(0~1)
+static const cv::Scalar kCOLOR_DA(0,0,255);   // 주행가능영역: 빨강
+static const cv::Scalar kCOLOR_LL(0,255,0);   // 차선: 초록
+static const cv::Scalar kCOLOR_DET(255,0,0);  // 디텍션 박스: 파랑(여기선 BGR)
+
+// ─── TRT Logger ──────────────────────────────────────────────────────────────
+struct Log : public ILogger {
   void log(Severity s, const char* msg) noexcept override {
-    if (s <= Severity::kWARNING) std::cout << "[TRT] " << msg << std::endl;
+    if (s <= Severity::kWARNING) std::cout << "[TRT] " << msg << "\n";
   }
 } gLogger;
 
-static void checkCuda(cudaError_t e){ if(e!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
+// ─── Detection helpers ───────────────────────────────────────────────────────
+struct Det {
+  cv::Rect2f box;
+  float score;
+  int cls; // YOLOP 기본 nc=1
+};
 
-static size_t vol(const Dims& d){ size_t v=1; for(int i=0;i<d.nbDims;i++) v*=static_cast<size_t>(d.d[i]); return v; }
-
-struct Box { float x1,y1,x2,y2,score; int cls; };
-
-static float iou(const Box& a, const Box& b){
-  float xx1=std::max(a.x1,b.x1), yy1=std::max(a.y1,b.y1);
-  float xx2=std::min(a.x2,b.x2), yy2=std::min(a.y2,b.y2);
-  float w=std::max(0.f, xx2-xx1), h=std::max(0.f, yy2-yy1);
-  float inter=w*h;
-  float areaA=std::max(0.f,a.x2-a.x1)*std::max(0.f,a.y2-a.y1);
-  float areaB=std::max(0.f,b.x2-b.x1)*std::max(0.f,b.y2-b.y1);
-  float u=areaA+areaB-inter; return u>0? inter/u:0.f;
-}
-static std::vector<Box> nms(std::vector<Box> v, float iouThr){
-  std::sort(v.begin(),v.end(),[](auto& a,auto& b){return a.score>b.score;});
-  std::vector<Box> keep; std::vector<char> rem(v.size(),0);
-  for(size_t i=0;i<v.size();++i){ if(rem[i]) continue; keep.push_back(v[i]);
-    for(size_t j=i+1;j<v.size();++j) if(!rem[j] && iou(v[i],v[j])>iouThr) rem[j]=1;
-  } return keep;
+static float iouRect(const cv::Rect2f& a, const cv::Rect2f& b){
+  float inter = (a & b).area();
+  float uni   = a.area() + b.area() - inter;
+  return uni > 0.f ? inter/uni : 0.f;
 }
 
-static bool guessDetIsNormalized(const float* det, int n, int step=6, float thr=2.0f){
-  int samples=0; double acc=0.0;
-  for(int i=0;i<n && samples<50;i++){
-    const float* p=&det[i*step];
-    if(p[4] < 0.2f) continue; // conf filter
-    acc += std::max(p[2],p[3]); // w/h
-    samples++;
+static std::vector<Det> nms(const std::vector<Det>& src, float iouTh=0.45f){
+  std::vector<Det> dets = src, keep;
+  std::sort(dets.begin(), dets.end(), [](auto& A, auto& B){return A.score > B.score;});
+  std::vector<int> alive(dets.size(), 1);
+  for (size_t i=0;i<dets.size();++i){
+    if(!alive[i]) continue;
+    keep.push_back(dets[i]);
+    for (size_t j=i+1;j<dets.size();++j){
+      if(!alive[j]) continue;
+      if (iouRect(dets[i].box, dets[j].box) > iouTh) alive[j] = 0;
+    }
   }
-  if(samples==0) return true;
-  return (acc/samples) < thr; // 평균 w/h가 2 미만이면 0~1 정규화로 추정
+  return keep;
 }
 
-static std::vector<char> loadFile(const std::string& path){
-  std::ifstream f(path, std::ios::binary);
-  if(!f) throw std::runtime_error("Cannot open file: "+path);
-  return std::vector<char>((std::istreambuf_iterator<char>(f)), {});
+static inline bool isNormalizedXYWH(float cx, float cy, float w, float h){
+  // 아주 러프하게: 값이 ~1.5 이하이면 정규화된 것으로 간주(640 스케일링 전)
+  return (cx <= 1.5f && cy <= 1.5f && w <= 1.5f && h <= 1.5f);
+}
+
+static void drawDetections(cv::Mat& vis,
+                           const std::vector<Det>& dets,
+                           const cv::Scalar& color = kCOLOR_DET) {
+  for (auto& d : dets){
+    cv::rectangle(vis, d.box, color, 2);
+    char buf[64]; std::snprintf(buf, sizeof(buf), "cls=%d %.2f", d.cls, d.score);
+    int base=0; auto size = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base);
+    cv::Rect2f r = d.box;
+    cv::Rect bg((int)r.x, std::max(0, (int)r.y- size.height-4), size.width+6, size.height+4);
+    bg &= cv::Rect(0,0, vis.cols, vis.rows);
+    cv::rectangle(vis, bg, color, cv::FILLED);
+    cv::putText(vis, buf, {bg.x+3, bg.y+bg.height-3}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1);
+  }
+}
+
+// ─── Mask cleanup: morphology + min-area ─────────────────────────────────────
+static cv::Mat cleanupMask(const cv::Mat& bin01, int minArea, int morphK=3, int morphIters=1){
+  CV_Assert(bin01.type()==CV_8U);
+  cv::Mat m = bin01.clone();
+  if (morphK > 1){
+    cv::Mat k = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(morphK, morphK));
+    cv::morphologyEx(m, m, cv::MORPH_OPEN, k, {-1,-1}, morphIters);
+  }
+  if (minArea <= 1) return m;
+
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(m, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  cv::Mat out = cv::Mat::zeros(m.size(), CV_8U);
+  for (auto& c : contours){
+    if (std::fabs(cv::contourArea(c)) >= minArea)
+      cv::drawContours(out, std::vector<std::vector<cv::Point>>{c}, -1, 255, cv::FILLED);
+  }
+  return out;
+}
+
+// ─── Utils ───────────────────────────────────────────────────────────────────
+static std::vector<char> readFile(const std::string& path){
+  std::ifstream ifs(path, std::ios::binary);
+  if(!ifs) throw std::runtime_error("cannot open: " + path);
+  return std::vector<char>(std::istreambuf_iterator<char>(ifs), {});
+}
+
+static cv::Mat letterbox(const cv::Mat& img, int newW, int newH,
+                         int& padX, int& padY, float& scale){
+  const int w = img.cols, h = img.rows;
+  scale = std::min(1.0f * newW / w, 1.0f * newH / h);
+  const int rw = int(w * scale);
+  const int rh = int(h * scale);
+  cv::Mat resized; cv::resize(img, resized, cv::Size(rw, rh));
+  cv::Mat out(newH, newW, img.type(), cv::Scalar(114,114,114));
+  padX = (newW - rw) / 2;
+  padY = (newH - rh) / 2;
+  resized.copyTo(out(cv::Rect(padX, padY, rw, rh)));
+  return out;
+}
+
+// BGR->RGB, [0,1], CHW, FP16
+static void toCHWFP16(const cv::Mat& bgr, int H, int W, __half* dst){
+  cv::Mat resized; cv::resize(bgr, resized, cv::Size(W, H));
+  cv::Mat rgb; cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+  rgb.convertTo(rgb, CV_32FC3, 1.0/255.0);
+  for(int c=0;c<3;++c){
+    for(int y=0;y<H;++y){
+      const float* row = rgb.ptr<float>(y);
+      for(int x=0;x<W;++x){
+        float v = row[x*3 + c];
+        dst[c*H*W + y*W + x] = __float2half(v);
+      }
+    }
+  }
+}
+
+// 2채널 softmax에서 channel1 확률 계산
+static void softmax2(const cv::Mat& c0, const cv::Mat& c1, cv::Mat& p1){
+  CV_Assert(c0.size()==c1.size() && c0.type()==CV_32F && c1.type()==CV_32F);
+  p1.create(c0.size(), CV_32F);
+  for(int y=0;y<c0.rows;++y){
+    const float* a = c0.ptr<float>(y);
+    const float* b = c1.ptr<float>(y);
+    float* p = p1.ptr<float>(y);
+    for(int x=0;x<c0.cols;++x){
+      float m = std::max(a[x], b[x]);
+      float ea = std::exp(a[x]-m);
+      float eb = std::exp(b[x]-m);
+      p[x] = eb / (ea + eb);
+    }
+  }
+}
+
+static void printTensorInfo(ICudaEngine* engine, const char* name){
+  auto mode = engine->getTensorIOMode(name);
+  auto dtype = engine->getTensorDataType(name);
+  auto dims = engine->getTensorShape(name);
+  std::cout << "  - " << name
+            << " (" << (mode==TensorIOMode::kINPUT?"INPUT":"OUTPUT")
+            << ") dtype=" << (int)dtype << " dims=[";
+  for(int k=0;k<dims.nbDims;++k){ std::cout << dims.d[k] << (k+1<dims.nbDims?",":""); }
+  std::cout << "]\n";
+}
+
+template<typename T>
+static void print_minmax(const std::vector<T>& v, const char* tag){
+  if(v.empty()){ std::cout << "[DBG] " << tag << " empty\n"; return; }
+  double mn=1e30, mx=-1e30;
+  for(auto &x: v){ double f = (double)x; mn = std::min(mn,f); mx = std::max(mx,f); }
+  std::cout << "[DBG] " << tag << " min="<< mn << " max="<< mx << "\n";
 }
 
 int main(int argc, char** argv){
-  if(argc < 3){
-    std::cerr << "Usage: " << argv[0] << " <engine.plan> <input_dir> [output_dir]\n";
+  try{
+    std::string planPath = (argc>=2)? argv[1] : "../yolop.plan";
+    std::string inDir    = (argc>=3)? argv[2] : "../../../inference/images";
+    std::string outDir   = (argc>=4)? argv[3] : "./out";
+    std::filesystem::create_directories(outDir);
+
+    // 1) Load engine
+    std::vector<char> blob = readFile(planPath);
+    std::unique_ptr<IRuntime> runtime(createInferRuntime(gLogger));
+    if(!runtime) throw std::runtime_error("createInferRuntime failed");
+    std::unique_ptr<ICudaEngine> engine(runtime->deserializeCudaEngine(blob.data(), blob.size()));
+    if(!engine) throw std::runtime_error("deserializeCudaEngine failed");
+
+    std::unique_ptr<IExecutionContext> ctx(engine->createExecutionContext());
+    if(!ctx) throw std::runtime_error("createExecutionContext failed");
+
+    // 바인딩 이름 (export_onnx_trt.py와 동일)
+    const char* IN      = "images";
+    const char* OUT_DET = "det_out";         // [1,25200,6]
+    const char* OUT_DA  = "drive_area_seg";  // [1,2,640,640] or [1,1,Ho,Wo]
+    const char* OUT_LL  = "lane_line_seg";   // [1,2,640,640] or [1,1,Ho,Wo]
+
+    // 바인딩 전체 출력
+    std::cout << "[TRT] I/O tensors:\n";
+    int nIO = engine->getNbIOTensors();
+    for(int i=0;i<nIO;++i){
+      const char* nm = engine->getIOTensorName(i);
+      printTensorInfo(engine.get(), nm);
+    }
+
+    // 2) 입력/출력 shape
+    Dims inD = engine->getTensorShape(IN); // [-1,3,640,640] or [1,3,640,640]
+    int B = (inD.d[0] > 0) ? inD.d[0] : 1;
+    int C = inD.d[1], H = inD.d[2], W = inD.d[3];
+    if (H < 0 || W < 0) {
+      // dynamic이면 명시 설정
+      ctx->setInputShape(IN, Dims4{1,3,640,640});
+      Dims inD2 = ctx->getTensorShape(IN);
+      B = inD2.d[0]; C = inD2.d[1]; H = inD2.d[2]; W = inD2.d[3];
+    }
+    if (B != 1 || C != 3) throw std::runtime_error("Expected input [1,3,H,W]");
+    std::cout << "[DBG] Input shape: " << B << "x" << C << "x" << H << "x" << W << "\n";
+
+    // 출력 dims (context에서 읽기)
+    auto daD = ctx->getTensorShape(OUT_DA);
+    auto llD = ctx->getTensorShape(OUT_LL);
+    int daC = (daD.nbDims>=2? daD.d[1]:-1);
+    int llC = (llD.nbDims>=2? llD.d[1]:-1);
+    int Ho  = (daD.nbDims>=4? daD.d[2]:-1), Wo = (daD.nbDims>=4? daD.d[3]:-1);
+    int H2  = (llD.nbDims>=4? llD.d[2]:-1), W2 = (llD.nbDims>=4? llD.d[3]:-1);
+
+    // 3) GPU buffer alloc (int vs int64_t 안전 처리)
+    size_t inBytes = (size_t)B*C*H*W*sizeof(__half);
+
+    auto safeMulElems = [](const Dims& d)->size_t{
+      size_t prod = 1;
+      for (int i=0;i<d.nbDims;++i) {
+        int64_t vi = static_cast<int64_t>(d.d[i]);
+        if (vi < 1) vi = 1;
+        prod *= static_cast<size_t>(vi);
+      }
+      return prod;
+    };
+
+    size_t daElems = safeMulElems(daD);
+    size_t llElems = safeMulElems(llD);
+
+    // ★ det_out dims/dtype/bytes 준비
+    Dims detD = ctx->getTensorShape(OUT_DET);               // [1,25200,6]
+    auto dtype_det = engine->getTensorDataType(OUT_DET);
+    size_t detElems = safeMulElems(detD);
+    size_t detBytes = detElems * (dtype_det==DataType::kHALF ? sizeof(__half) : sizeof(float));
+
+    auto dtype_da = engine->getTensorDataType(OUT_DA);
+    auto dtype_ll = engine->getTensorDataType(OUT_LL);
+    size_t daBytes = daElems * (dtype_da==DataType::kHALF ? sizeof(__half) : sizeof(float));
+    size_t llBytes = llElems * (dtype_ll==DataType::kHALF ? sizeof(__half) : sizeof(float));
+
+    std::cout << "[DBG] DET dtype="<<(int)dtype_det<<" elems="<<detElems<<" bytes="<<detBytes<<"\n";
+    std::cout << "[DBG] DA  dtype="<<(int)dtype_da <<" elems="<<daElems <<" bytes="<<daBytes <<"\n";
+    std::cout << "[DBG] LL  dtype="<<(int)dtype_ll <<" elems="<<llElems <<" bytes="<<llBytes <<"\n";
+
+    void *dIn=nullptr, *dDa=nullptr, *dLl=nullptr, *dDet=nullptr;
+    cudaMalloc(&dIn, inBytes);
+    cudaMalloc(&dDa, daBytes);
+    cudaMalloc(&dLl, llBytes);
+    cudaMalloc(&dDet, detBytes);  // ★ det_out 실제 크기로 할당
+
+    cudaStream_t stream; cudaStreamCreate(&stream);
+
+    // 바인딩 주소 설정
+    ctx->setTensorAddress(IN, dIn);
+    ctx->setTensorAddress(OUT_DET, dDet);
+    ctx->setTensorAddress(OUT_DA, dDa);
+    ctx->setTensorAddress(OUT_LL, dLl);
+
+    // 4) 추론 루프
+    for (auto& file : std::filesystem::directory_iterator(inDir)){
+      if(!file.is_regular_file()) continue;
+      std::string ext = file.path().extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+      if (ext != ".jpg" && ext != ".jpeg" && ext != ".png") continue;
+
+      cv::Mat img = cv::imread(file.path().string());
+      if(img.empty()){
+        std::cerr << "skip " << file.path() << " (cannot read)\n";
+        continue;
+      }
+
+      // letterbox 입력
+      int padX=0, padY=0; float scale=1.0f;
+      cv::Mat lb = letterbox(img, W, H, padX, padY, scale);
+
+      std::vector<__half> inHost((size_t)B*C*H*W);
+      toCHWFP16(lb, H, W, inHost.data());
+
+      // H2D + infer
+      cudaMemcpyAsync(dIn, inHost.data(), inBytes, cudaMemcpyHostToDevice, stream);
+      if(!ctx->enqueueV3(stream)) throw std::runtime_error("enqueueV3 failed");
+      cudaStreamSynchronize(stream);
+
+      // ─── D2H (FP16/FP32 분기) : 세그 ────────────────────────────────────────
+      std::vector<float> daHostF, llHostF;
+      if (dtype_da == DataType::kHALF){
+        std::vector<__half> h(daElems);
+        cudaMemcpyAsync(h.data(), dDa, daBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        daHostF.resize(daElems);
+        for(size_t i=0;i<daElems;++i) daHostF[i] = __half2float(h[i]);
+      } else {
+        daHostF.resize(daElems);
+        cudaMemcpyAsync(daHostF.data(), dDa, daBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+      }
+      if (dtype_ll == DataType::kHALF){
+        std::vector<__half> h(llElems);
+        cudaMemcpyAsync(h.data(), dLl, llBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        llHostF.resize(llElems);
+        for(size_t i=0;i<llElems;++i) llHostF[i] = __half2float(h[i]);
+      } else {
+        llHostF.resize(llElems);
+        cudaMemcpyAsync(llHostF.data(), dLl, llBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+      }
+
+      // ─── D2H (FP16/FP32 분기) : 디텍션 ─────────────────────────────────────
+      std::vector<float> detHostF;
+      if (dtype_det == DataType::kHALF){
+        std::vector<__half> tmp(detElems);
+        cudaMemcpyAsync(tmp.data(), dDet, detBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        detHostF.resize(detElems);
+        for(size_t i=0;i<detElems;++i) detHostF[i] = __half2float(tmp[i]);
+      } else {
+        detHostF.resize(detElems);
+        cudaMemcpyAsync(detHostF.data(), dDet, detBytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+      }
+
+      // shape가 아직 -1인 경우 대비(일부 버전): 다시 읽음
+      if (Ho <= 0 || Wo <= 0 || H2 <= 0 || W2 <= 0) {
+        daD = ctx->getTensorShape(OUT_DA);
+        llD = ctx->getTensorShape(OUT_LL);
+        daC = daD.d[1]; llC = llD.d[1];
+        Ho = daD.d[2]; Wo = daD.d[3];
+        H2 = llD.d[2]; W2 = llD.d[3];
+      }
+
+      std::cout << "[DBG] OUT_DA shape: ["<< daD.d[0]<<","<<daC<<","<<Ho<<","<<Wo<<"]\n";
+      std::cout << "[DBG] OUT_LL shape: ["<< llD.d[0]<<","<<llC<<","<<H2<<","<<W2<<"]\n";
+      print_minmax(daHostF, "DA raw");
+      print_minmax(llHostF, "LL raw");
+      print_minmax(detHostF, "DET raw");
+
+      // ─── 세그: 확률/마스크 생성 ───────────────────────────────────────────
+      // (확률 PNG는 파일별로 저장)
+      auto save_prob_png = [&](const cv::Mat& prob, const std::string& name){
+        cv::Mat u8; prob.convertTo(u8, CV_8U, 255.0);
+        cv::imwrite(name, u8);
+      };
+
+      std::string base = file.path().stem().string();
+
+      cv::Mat daMaskLb, llMaskLb;
+      if (daC == 2){
+        cv::Mat c0(Ho, Wo, CV_32F, daHostF.data() + 0*Ho*Wo);
+        cv::Mat c1(Ho, Wo, CV_32F, daHostF.data() + 1*Ho*Wo);
+        cv::Mat prob1; softmax2(c0, c1, prob1);
+        daMaskLb = (prob1 > kSEG_THRESH);
+        save_prob_png(prob1, (std::filesystem::path(outDir)/(base+"__da_prob_lb.png")).string());
+      } else if (daC == 1){
+        cv::Mat prob(Ho, Wo, CV_32F, daHostF.data());
+        daMaskLb = (prob > kSEG_THRESH);
+        save_prob_png(prob, (std::filesystem::path(outDir)/(base+"__da_prob_lb.png")).string());
+      } else {
+        throw std::runtime_error("Unexpected DA channels (expected 1 or 2)");
+      }
+
+      if (llC == 2){
+        cv::Mat c0(H2, W2, CV_32F, llHostF.data() + 0*H2*W2);
+        cv::Mat c1(H2, W2, CV_32F, llHostF.data() + 1*H2*W2);
+        cv::Mat prob1; softmax2(c0, c1, prob1);
+        llMaskLb = (prob1 > kSEG_THRESH);
+        save_prob_png(prob1, (std::filesystem::path(outDir)/(base+"__ll_prob_lb.png")).string());
+      } else if (llC == 1){
+        cv::Mat prob(H2, W2, CV_32F, llHostF.data());
+        llMaskLb = (prob > kSEG_THRESH);
+        save_prob_png(prob, (std::filesystem::path(outDir)/(base+"__ll_prob_lb.png")).string());
+      } else {
+        throw std::runtime_error("Unexpected LL channels (expected 1 or 2)");
+      }
+
+      // 레터박스 공간에서 마스크 저장
+      cv::imwrite((std::filesystem::path(outDir)/(base+"__da_mask_lb.png")).string(), daMaskLb*255);
+      cv::imwrite((std::filesystem::path(outDir)/(base+"__ll_mask_lb.png")).string(), llMaskLb*255);
+
+      // ─── 언레터박스: pad 제거 → 원본 크기 ─────────────────────────────────
+      int rw = int(img.cols * scale);
+      int rh = int(img.rows * scale);
+      int x0 = std::max(0, padX), y0 = std::max(0, padY);
+      int w0 = std::min(W - x0, rw);
+      int h0 = std::min(H - y0, rh);
+      if (w0<=0 || h0<=0) {
+        std::cerr << "[WARN] invalid crop size: w0="<<w0<<" h0="<<h0
+                  << " (padX="<<padX<<" padY="<<padY<<" rw="<<rw<<" rh="<<rh<<")\n";
+        continue;
+      }
+
+      cv::Mat daCrop = daMaskLb(cv::Rect(x0, y0, w0, h0));
+      cv::Mat llCrop = llMaskLb(cv::Rect(x0, y0, w0, h0));
+      cv::Mat daMask, llMask;
+      cv::resize(daCrop, daMask, img.size(), 0, 0, cv::INTER_NEAREST);
+      cv::resize(llCrop, llMask, img.size(), 0, 0, cv::INTER_NEAREST);
+
+      // ─── 마스크 클린업 (잡티 제거) ────────────────────────────────────────
+      daMask = cleanupMask(daMask, /*minArea=*/600, /*morphK=*/3, /*iters=*/1);
+      llMask = cleanupMask(llMask, /*minArea=*/150, /*morphK=*/3, /*iters=*/1);
+
+      // 원본 공간 마스크 저장
+      cv::imwrite((std::filesystem::path(outDir)/(base+"__da_mask.png")).string(), daMask*255);
+      cv::imwrite((std::filesystem::path(outDir)/(base+"__ll_mask.png")).string(), llMask*255);
+
+      // ─── 디텍션: 디코드 → 언레터박스 → NMS ──────────────────────────────
+      const int stride = detD.d[2]; // = 6
+      const int num    = detD.d[1]; // = 25200
+
+      std::vector<Det> dets; dets.reserve(256);
+      bool isNorm = true;
+      for (int i=0;i<num; ++i){
+        const float cx = detHostF[i*stride + 0];
+        const float cy = detHostF[i*stride + 1];
+        const float w  = detHostF[i*stride + 2];
+        const float h  = detHostF[i*stride + 3];
+        const float obj= detHostF[i*stride + 4];
+        const float cls= detHostF[i*stride + 5]; // nc=1
+
+        if (i==0) isNorm = isNormalizedXYWH(cx,cy,w,h);
+        float score = obj * cls;
+        if (score < kDET_CONF) continue;
+
+        float ccx=cx, ccy=cy, ww=w, hh=h;
+        if (isNorm){ ccx *= W; ccy *= H; ww *= W; hh *= H; } // letterbox 공간(640x640)
+
+        // xywh→xyxy (letterbox 공간)
+        float x1 = ccx - ww*0.5f;
+        float y1 = ccy - hh*0.5f;
+        float x2 = ccx + ww*0.5f;
+        float y2 = ccy + hh*0.5f;
+
+        // 언레터박스 → 원본 좌표
+        x1 -= padX; x2 -= padX;
+        y1 -= padY; y2 -= padY;
+        if (scale > 0.f){
+          x1 /= scale; x2 /= scale;
+          y1 /= scale; y2 /= scale;
+        }
+        x1 = std::clamp(x1, 0.f, (float)img.cols-1);
+        y1 = std::clamp(y1, 0.f, (float)img.rows-1);
+        x2 = std::clamp(x2, 0.f, (float)img.cols-1);
+        y2 = std::clamp(y2, 0.f, (float)img.rows-1);
+
+        if (x2-x1 < 1.f || y2-y1 < 1.f) continue; // 너무 작은 박스 제거
+        dets.push_back( Det{ cv::Rect2f(x1,y1, x2-x1, y2-y1), score, 0 } );
+      }
+
+      std::cout << "[DBG] det candidates="<<dets.size()<<"\n";
+      dets = nms(dets, kDET_NMS);
+      std::cout << "[DBG] det kept="<<dets.size()<<"\n";
+
+      // ─── 시각화 (alpha blending + det 박스) ──────────────────────────────
+      cv::Mat vis; img.copyTo(vis);
+      cv::Mat tintDA(vis.size(), CV_8UC3, kCOLOR_DA);
+      cv::Mat tintLL(vis.size(), CV_8UC3, kCOLOR_LL);
+
+      cv::Mat visDA = vis.clone();
+      tintDA.copyTo(visDA, daMask);
+      cv::addWeighted(vis, 1.0-kALPHA, visDA, kALPHA, 0.0, vis);
+
+      cv::Mat visLL = vis.clone();
+      tintLL.copyTo(visLL, llMask);
+      cv::addWeighted(vis, 1.0-kALPHA, visLL, kALPHA, 0.0, vis);
+
+      drawDetections(vis, dets, kCOLOR_DET);
+
+      const std::string outPath = (std::filesystem::path(outDir) / file.path().filename()).string();
+      cv::imwrite(outPath, vis);
+      std::cout << "Saved: " << outPath << "\n";
+    }
+
+    // cleanup
+    cudaStreamDestroy(stream);
+    cudaFree(dIn); cudaFree(dDa); cudaFree(dLl); cudaFree(dDet);
+    return 0;
+
+  } catch(const std::exception& e){
+    std::cerr << "[ERR] " << e.what() << "\n";
     return 1;
   }
-  const std::string enginePath = argv[1];
-  const fs::path inDir = argv[2];
-  const fs::path outDir = (argc>=4)? fs::path(argv[3]) : (inDir / "outputs");
-
-  if(!fs::exists(inDir) || !fs::is_directory(inDir)){
-    std::cerr << "Input dir not found: " << inDir << "\n";
-    return 1;
-  }
-  fs::create_directories(outDir);
-
-  // ── 엔진 로드 (TRT10)
-  auto blob = loadFile(enginePath);
-
-  // 모든 TensorRT 객체는 TRT10에서 destroy()가 아니라 delete 사용!
-  auto runtime = std::unique_ptr<IRuntime, void(*)(IRuntime*)>(
-      createInferRuntime(gLogger),
-      [](IRuntime* p){ delete p; }
-  );
-
-  auto engine = std::unique_ptr<ICudaEngine, void(*)(ICudaEngine*)>(
-      runtime ? runtime->deserializeCudaEngine(blob.data(), blob.size()) : nullptr,
-      [](ICudaEngine* p){ delete p; }
-  );
-
-  auto ctx = std::unique_ptr<IExecutionContext, void(*)(IExecutionContext*)>(
-      engine ? engine->createExecutionContext() : nullptr,
-      [](IExecutionContext* p){ delete p; }
-  );
-
-  if(!engine || !ctx){
-    std::cerr<<"Engine/Context creation failed\n";
-    return 2;
-  }
-
-  // ── 텐서 이름 (dump 결과 반영)
-  const char* IN  = "images";
-  const char* DET = "det_out";         // [1,25200,6]
-  const char* DA  = "drive_area_seg";  // [1,2,640,640]
-  const char* LL  = "lane_line_seg";   // [1,2,640,640]
-
-  // ── 텐서 shape
-  Dims inDims  = engine->getTensorShape(IN);
-  Dims detDims = engine->getTensorShape(DET);
-  Dims daDims  = engine->getTensorShape(DA);
-  Dims llDims  = engine->getTensorShape(LL);
-
-  if(inDims.nbDims!=4 || inDims.d[0]!=1 || inDims.d[1]!=3){ std::cerr<<"Expect IN [1,3,H,W]\n"; return 3; }
-  if(detDims.nbDims!=3 || detDims.d[2]!=6){ std::cerr<<"Expect DET [1,N,6]\n"; return 3; }
-  if(daDims.nbDims!=4 || daDims.d[1]!=2 || llDims.nbDims!=4 || llDims.d[1]!=2){ std::cerr<<"Expect seg [1,2,H,W]\n"; return 3; }
-
-  const int C=inDims.d[1], H=inDims.d[2], W=inDims.d[3];
-  const int Ndet=detDims.d[1];
-
-  const size_t inBytes  = vol(inDims)*sizeof(float);
-  const size_t detBytes = vol(detDims)*sizeof(float);
-  const size_t daBytes  = vol(daDims)*sizeof(float);
-  const size_t llBytes  = vol(llDims)*sizeof(float);
-
-  // ── 디바이스 버퍼
-  void *dIn=nullptr, *dDet=nullptr, *dDa=nullptr, *dLl=nullptr;
-  checkCuda(cudaMalloc(&dIn,  inBytes));
-  checkCuda(cudaMalloc(&dDet, detBytes));
-  checkCuda(cudaMalloc(&dDa,  daBytes));
-  checkCuda(cudaMalloc(&dLl,  llBytes));
-
-  // 동적 입력 대비 (여기서는 고정이라 그대로)
-  ctx->setInputShape(IN, inDims);
-
-  // 엔진에 텐서 주소 연결 (TRT10: 이름 기반)
-  ctx->setTensorAddress(IN,  dIn);
-  ctx->setTensorAddress(DET, dDet);
-  ctx->setTensorAddress(DA,  dDa);
-  ctx->setTensorAddress(LL,  dLl);
-
-  // ── 입력 폴더의 모든 jpg/jpeg 처리
-  int processed=0;
-  for(auto& entry : fs::directory_iterator(inDir)){
-    if(!entry.is_regular_file()) continue;
-    auto ext = entry.path().extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    if(ext != ".jpg" && ext != ".jpeg") continue;
-
-    const fs::path inPath = entry.path();
-    const fs::path outPath = outDir / inPath.filename();
-
-    cv::Mat img = cv::imread(inPath.string());
-    if(img.empty()){ std::cerr<<"Cannot read image: "<<inPath<<"\n"; continue; }
-
-    // 전처리 BGR->RGB, HWC->CHW, 0~1
-    cv::Mat resized; cv::resize(img, resized, cv::Size(W,H));
-    std::vector<float> inHost(C*H*W);
-    for(int y=0;y<H;y++){
-      const uchar* p = resized.ptr<uchar>(y);
-      for(int x=0;x<W;x++){
-        // B,G,R -> RGB
-        float r = p[x*3+2]/255.f, g=p[x*3+1]/255.f, b=p[x*3+0]/255.f;
-        inHost[0*H*W + y*W + x] = r;
-        inHost[1*H*W + y*W + x] = g;
-        inHost[2*H*W + y*W + x] = b;
-      }
-    }
-    checkCuda(cudaMemcpy(dIn, inHost.data(), inBytes, cudaMemcpyHostToDevice));
-
-    // 추론 (TRT10: enqueueV3(stream)만 받음)
-    cudaStream_t stream = 0;
-    if(!ctx->enqueueV3(stream)){ std::cerr<<"enqueueV3 failed on "<<inPath<<"\n"; continue; }
-    checkCuda(cudaStreamSynchronize(stream));
-
-    // Host로 결과 복사
-    std::vector<float> detHost(detBytes/sizeof(float));
-    std::vector<float> daHost (daBytes /sizeof(float));
-    std::vector<float> llHost (llBytes /sizeof(float));
-    checkCuda(cudaMemcpy(detHost.data(), dDet, detBytes, cudaMemcpyDeviceToHost));
-    checkCuda(cudaMemcpy( daHost.data(),  dDa,  daBytes,  cudaMemcpyDeviceToHost));
-    checkCuda(cudaMemcpy( llHost.data(),  dLl,  llBytes,  cudaMemcpyDeviceToHost));
-
-    // 세그: 2채널 argmax → 바이너리 마스크
-    const int sH=daDims.d[2], sW=daDims.d[3];
-    cv::Mat daMask(sH,sW,CV_8U), llMask(sH,sW,CV_8U);
-    for(int y=0;y<sH;y++){
-      for(int x=0;x<sW;x++){
-        float da0 = daHost[0*sH*sW + y*sW + x];
-        float da1 = daHost[1*sH*sW + y*sW + x];
-        float ll0 = llHost[0*sH*sW + y*sW + x];
-        float ll1 = llHost[1*sH*sW + y*sW + x];
-        daMask.at<uchar>(y,x) = (da1>da0)? 255:0;
-        llMask.at<uchar>(y,x) = (ll1>ll0)? 255:0;
-      }
-    }
-
-    // 디텍션 decode + NMS
-    bool isNormalized = guessDetIsNormalized(detHost.data(), Ndet, 6, 2.0f);
-    float confThr=0.35f, iouThr=0.45f;
-    std::vector<Box> boxes; boxes.reserve(256);
-    for(int i=0;i<Ndet;i++){
-      const float* p = &detHost[i*6];
-      float conf=p[4]; if(conf<confThr) continue;
-      int cls = int(std::round(p[5]));
-
-      float cx=p[0], cy=p[1], w=p[2], h=p[3];
-      if(isNormalized){ cx*=W; cy*=H; w*=W; h*=H; }
-
-      float x1 = std::clamp(cx-w*0.5f, 0.f, float(W-1));
-      float y1 = std::clamp(cy-h*0.5f, 0.f, float(H-1));
-      float x2 = std::clamp(cx+w*0.5f, 0.f, float(W-1));
-      float y2 = std::clamp(cy+h*0.5f, 0.f, float(H-1));
-      boxes.push_back({x1,y1,x2,y2,conf,cls});
-    }
-    boxes = nms(std::move(boxes), iouThr);
-
-    // 시각화: 세그 오버레이 + 박스
-    cv::Mat daR, llR; 
-    cv::resize(daMask, daR, img.size(), 0,0, cv::INTER_NEAREST);
-    cv::resize(llMask, llR, img.size(), 0,0, cv::INTER_NEAREST);
-
-    cv::Mat vis = img.clone();
-    vis.setTo(cv::Scalar(0,0,255), daR);     // 도로: 빨강
-    vis.setTo(cv::Scalar(0,255,0), llR);     // 차선: 초록
-
-    float sx=float(img.cols)/float(W), sy=float(img.rows)/float(H);
-    for(const auto& b: boxes){
-      cv::Point p1(int(b.x1*sx), int(b.y1*sy));
-      cv::Point p2(int(b.x2*sx), int(b.y2*sy));
-      cv::rectangle(vis, p1, p2, cv::Scalar(255,200,0), 2);
-      char buf[64]; std::snprintf(buf,sizeof(buf),"c%d %.2f", b.cls, b.score);
-      cv::putText(vis, buf, p1+cv::Point(0,-4), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,200,0), 1);
-    }
-
-    if(!cv::imwrite(outPath.string(), vis)){
-      std::cerr<<"Failed to save: "<<outPath<<"\n"; continue;
-    }
-    std::cout<<"Processed: "<<inPath<<" -> "<<outPath<<"\n";
-    processed++;
-  }
-
-  std::cout<<"Done. images processed = "<<processed<<"\n";
-  cudaFree(dIn); cudaFree(dDet); cudaFree(dDa); cudaFree(dLl);
-  return 0;
 }

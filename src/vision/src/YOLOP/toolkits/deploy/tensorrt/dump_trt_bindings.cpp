@@ -1,35 +1,44 @@
 #include <NvInfer.h>
+#include <NvInferRuntime.h>
+#include <cuda_runtime_api.h>
+#include <memory>
 #include <iostream>
 #include <fstream>
-#include <memory>
 #include <vector>
+#include <string>
 
-struct Logger : nvinfer1::ILogger {
+using namespace nvinfer1;
+
+struct Logger : public ILogger {
   void log(Severity s, const char* msg) noexcept override {
-    if (s <= Severity::kWARNING) std::cout << "[TRT] " << msg << std::endl;
+    if (s <= Severity::kWARNING) std::cout << "[TRT] " << msg << "\n";
   }
 } gLogger;
 
+static std::vector<char> readFile(const std::string& path){
+  std::ifstream ifs(path, std::ios::binary);
+  if(!ifs) throw std::runtime_error("cannot open: " + path);
+  return std::vector<char>(std::istreambuf_iterator<char>(ifs), {});
+}
+
 int main(int argc, char** argv){
-  if(argc < 2){ std::cout << "Usage: " << argv[0] << " <engine.plan>\n"; return 0; }
-  std::ifstream f(argv[1], std::ios::binary);
-  if(!f.good()){ std::cerr << "Cannot open engine: " << argv[1] << "\n"; return 1; }
-  std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
-  auto runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-  auto engine  = std::unique_ptr<nvinfer1::ICudaEngine>(runtime->deserializeCudaEngine(data.data(), data.size()));
-  if(!engine){ std::cerr << "Failed to deserialize engine\n"; return 2; }
-
-  int n = engine->getNbIOTensors();
-  std::cout << "I/O Tensors (" << n << "):\n";
-  for(int i=0; i<n; ++i){
-    const char* name = engine->getIOTensorName(i);
-    auto mode = engine->getTensorIOMode(name);
-    auto dims = engine->getTensorShape(name);
-    std::cout << "  ["<<i<<"] " << (mode==nvinfer1::TensorIOMode::kINPUT?"INPUT ":"OUTPUT")
-              << " name='"<<name<<"' shape=[";
-    for(int d=0; d<dims.nbDims; ++d){ std::cout << dims.d[d]; if(d+1<dims.nbDims) std::cout<<"x"; }
-    std::cout << "]\n";
+  try{
+    std::string plan = (argc>=2)? argv[1] : "../yolop.plan";
+    std::vector<char> blob = readFile(plan);
+    std::unique_ptr<IRuntime> runtime(createInferRuntime(gLogger));
+    std::unique_ptr<ICudaEngine> engine(runtime->deserializeCudaEngine(blob.data(), blob.size()));
+    int n = engine->getNbIOTensors();
+    std::cout << "I/O Tensors ("<<n<<"):\n";
+    for(int i=0;i<n;++i){
+      const char* name = engine->getIOTensorName(i);
+      auto mode = engine->getTensorIOMode(name);
+      auto dims = engine->getTensorShape(name);
+      std::cout << "  ["<<i<<"] "<<(mode==TensorIOMode::kINPUT ? "INPUT " : "OUTPUT ") << "name='"<<name<<"' shape=[";
+      for(int d=0; d<dims.nbDims; ++d){ std::cout<<dims.d[d]; if(d+1<dims.nbDims) std::cout<<"x"; }
+      std::cout << "]\n";
+    }
+    return 0;
+  }catch(const std::exception& e){
+    std::cerr << e.what() << "\n"; return 1;
   }
-  return 0;
 }
