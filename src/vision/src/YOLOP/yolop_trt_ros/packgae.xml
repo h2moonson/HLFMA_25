@@ -1,11 +1,19 @@
+<?xml version="1.0"?>
 <package format="2">
   <name>yolop_trt_ros</name>
   <version>0.1.0</version>
-  <maintainer email="you@example.com">you</maintainer>
+  <description>ROS wrapper for YOLOP TensorRT core</description>
+
+  <maintainer email="hmson@example.com">hmson</maintainer>
   <license>BSD</license>
+
   <buildtool_depend>catkin</buildtool_depend>
+
   <depend>roscpp</depend>
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>image_transport</depend>
+
+  <build_depend>opencv2</build_depend>
+  <exec_depend>opencv2</exec_depend>
 </package>
