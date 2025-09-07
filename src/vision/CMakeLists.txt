@@ -57,21 +57,21 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -Wall -Ofast -Wfatal-errors -
 add_definitions(-O3 -pthread)
 
 ## CUDA로 플러그인 라이브러리 생성 (예: yololayer.cu)
-cuda_add_library(myplugins SHARED ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yololayer.cu)
-target_link_libraries(myplugins nvinfer cudart)
+# cuda_add_library(myplugins SHARED ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yololayer.cu)
+# target_link_libraries(myplugins nvinfer cudart)
 
 ## 메인 실행 파일 생성 (yolop_node.cpp, yolop.cpp, common.cpp)
-add_executable(yolop_node 
-  ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yolop_node.cpp 
-  ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yolop.cpp 
-  ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/common.cpp
-)
+# add_executable(yolop_node 
+#   ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yolop_node.cpp 
+#   ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/yolop.cpp 
+#   ${PROJECT_SOURCE_DIR}/src/tensorrtx/yolop/common.cpp
+# )
 
-## 메인 실행 파일에 필요한 라이브러리 링크 (TensorRT, CUDA, OpenCV, catkin 라이브러리 포함)
-target_link_libraries(yolop_node 
-  nvinfer 
-  cudart 
-  myplugins 
-  ${OpenCV_LIBS}
-  ${catkin_LIBRARIES}
-)
+# ## 메인 실행 파일에 필요한 라이브러리 링크 (TensorRT, CUDA, OpenCV, catkin 라이브러리 포함)
+# target_link_libraries(yolop_node 
+#   nvinfer 
+#   cudart 
+#   myplugins 
+#   ${OpenCV_LIBS}
+#   ${catkin_LIBRARIES}
+# )
