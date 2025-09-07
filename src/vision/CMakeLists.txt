@@ -45,7 +45,7 @@ include_directories(/usr/local/cuda/include)
 link_directories(/usr/local/cuda/lib64)
 
 ## OpenCV 설정
-find_package(OpenCV 3.2 REQUIRED)
+find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 ## TensorRT 설정

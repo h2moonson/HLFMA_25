@@ -1,0 +1,7 @@
+seg_th: 0.45
+det_conf: 0.30
+nms_iou: 0.45
+da_min_area: 600
+ll_min_area: 150
+publish_overlay: true
+publish_masks: true

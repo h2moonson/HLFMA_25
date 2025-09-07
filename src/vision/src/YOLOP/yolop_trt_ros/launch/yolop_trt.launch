@@ -1,0 +1,7 @@
+<launch>
+  <node pkg="yolop_trt_ros" type="yolop_trt_node" name="yolop_trt_node" output="screen">
+    <rosparam file="$(find yolop_trt_ros)/config/params.yaml" command="load" />
+    <param name="engine_path" value="$(env HLFMA_ROOT)/models/yolop/yolop.plan"/>
+    <param name="image_topic" value="/camera/image_raw"/>
+  </node>
+</launch>
